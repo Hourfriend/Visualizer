@@ -79,6 +79,23 @@ body.panel-collapsed #ptab-arrow{transform:rotate(180deg);}
   padding-bottom:5px;border-bottom:1px solid rgba(255,255,255,0.06);
 }
 
+/* ── Record section ───────────────────────────────────────────────────────── */
+#rec-btn{
+  width:100%;padding:9px 0;
+  font-family:var(--fd);font-size:8.5px;letter-spacing:.28em;text-transform:uppercase;
+  color:rgba(255,120,120,0.9);background:transparent;
+  border:1px solid rgba(255,80,80,0.35);border-radius:2px;
+  cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px;
+}
+#rec-btn:hover{background:rgba(255,60,60,0.08);border-color:rgba(255,80,80,0.7);}
+#rec-btn.recording{color:#fff;border-color:rgba(255,80,80,0.85);background:rgba(255,40,40,0.12);animation:rec-pulse 1.2s ease-in-out infinite;}
+@keyframes rec-pulse{0%,100%{box-shadow:0 0 6px rgba(255,60,60,0.3);}50%{box-shadow:0 0 18px rgba(255,60,60,0.7);}}
+#rec-dot{width:7px;height:7px;border-radius:50%;background:rgba(255,80,80,0.8);flex-shrink:0;transition:background .2s;}
+#rec-btn.recording #rec-dot{background:#ff4444;box-shadow:0 0 8px #ff4444;animation:dot-blink .8s step-start infinite;}
+@keyframes dot-blink{50%{opacity:0;}}
+#rec-timer{font-family:var(--fm);font-size:9px;letter-spacing:.18em;color:rgba(255,255,255,0.35);text-align:center;min-height:13px;}
+#rec-note{font-family:var(--fm);font-size:7px;letter-spacing:.1em;color:rgba(255,255,255,0.18);text-align:center;line-height:1.5;}
+
 /* ── Source ─────────────────────────────────────────────────────────────────── */
 #file-input{display:none;}
 #upload-lbl{
@@ -315,6 +332,14 @@ input[type=range]::-webkit-slider-thumb{
 
   </div>
 
+  <!-- ── RECORD ────────────────────────────── -->
+  <div class="sec">
+    <div class="sec-lbl">Record</div>
+    <button id="rec-btn"><div id="rec-dot"></div><span id="rec-label">Start Recording</span></button>
+    <div id="rec-timer"></div>
+    <div id="rec-note">Saves as .webm · plays in Chrome, Firefox, VLC<br>Convert to MP4 free with HandBrake or ffmpeg</div>
+  </div>
+
 </div><!-- /panel-body -->
 </div><!-- /panel -->
 
@@ -348,6 +373,9 @@ let doLoop=false,mode='idle';
 let sensitivity=1.5,glowAmt=20;
 let doRotate=true,doTrails=false;
 let rotation=0,rotSpeed=0;
+// ── Recorder state ───────────────────────────────────────────────────────────
+let mediaRec=null,recChunks=[],recStartTime=0,recTimerInterval=null,isRecording=false;
+let audioDestNode=null;
 let layers={};
 LAYER_DEFS.forEach(d=>{layers[d.id]={band:d.def,sens:1.5,spinSpeed:1.0,spinDir:d.id==='seed'?-1:1,amp:0,as:0,peak:0,vel:0,rot:0,rotV:0};});
 
@@ -522,7 +550,10 @@ async function initAudio(){
   if(!gainNode){
     gainNode=audioCtx.createGain();
     gainNode.gain.value=parseFloat(document.getElementById('vol').value);
+    // audioDestNode captures the mixed audio for recording
+    audioDestNode=audioCtx.createMediaStreamDestination();
     gainNode.connect(audioCtx.destination);
+    gainNode.connect(audioDestNode);
   }
 }
 
@@ -781,6 +812,86 @@ function animate(){
   drawSeed(cx,cy,baseR,layers.seed.amp,layers.seed.rot);
   drawCore(cx,cy,baseR,layers.core.amp,layers.core.rot);
   ctx.restore();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Recorder
+// ════════════════════════════════════════════════════════════════════════════
+document.getElementById('rec-btn').addEventListener('click', ()=>{
+  isRecording ? stopRecording() : startRecording();
+});
+
+function startRecording(){
+  if(isRecording) return;
+
+  // Canvas video stream at 60 fps
+  const canvasStream = cv.captureStream(60);
+
+  // Merge audio if available
+  const tracks = [...canvasStream.getVideoTracks()];
+  if(audioDestNode){
+    audioDestNode.stream.getAudioTracks().forEach(t=>tracks.push(t));
+  }
+  const combined = new MediaStream(tracks);
+
+  // Pick best supported format
+  const mimeType = ['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm']
+    .find(m=>MediaRecorder.isTypeSupported(m)) || 'video/webm';
+
+  recChunks = [];
+  try{
+    mediaRec = new MediaRecorder(combined, {mimeType, videoBitsPerSecond: 8_000_000});
+  }catch(e){
+    mediaRec = new MediaRecorder(combined);
+  }
+
+  mediaRec.ondataavailable = e=>{ if(e.data.size>0) recChunks.push(e.data); };
+  mediaRec.onstop = ()=>{ downloadRecording(); };
+  mediaRec.start(100); // collect chunks every 100ms
+
+  isRecording = true;
+  recStartTime = Date.now();
+  recTimerInterval = setInterval(updateRecTimer, 500);
+  updateRecTimer();
+
+  const btn = document.getElementById('rec-btn');
+  btn.classList.add('recording');
+  document.getElementById('rec-label').textContent = 'Stop & Save';
+  document.getElementById('rec-timer').textContent = '⏺ Recording 0:00';
+}
+
+function stopRecording(){
+  if(!isRecording || !mediaRec) return;
+  isRecording = false;
+  clearInterval(recTimerInterval);
+  mediaRec.stop();
+
+  const btn = document.getElementById('rec-btn');
+  btn.classList.remove('recording');
+  document.getElementById('rec-label').textContent = 'Start Recording';
+  document.getElementById('rec-timer').textContent = 'Saving…';
+}
+
+function updateRecTimer(){
+  if(!isRecording) return;
+  const s = Math.floor((Date.now()-recStartTime)/1000);
+  const m = Math.floor(s/60), ss = String(s%60).padStart(2,'0');
+  document.getElementById('rec-timer').textContent = `⏺ Recording ${m}:${ss}`;
+}
+
+function downloadRecording(){
+  if(!recChunks.length) return;
+  const blob = new Blob(recChunks, {type:'video/webm'});
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  const ts   = new Date().toISOString().slice(0,19).replace(/[T:]/g,'-');
+  a.href     = url;
+  a.download = `geometry-${ts}.webm`;
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(url), 10000);
+  recChunks  = [];
+  document.getElementById('rec-timer').textContent = 'Saved ✓';
+  setTimeout(()=>{ document.getElementById('rec-timer').textContent=''; }, 3000);
 }
 
 animate();
